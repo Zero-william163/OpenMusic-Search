@@ -54,7 +54,9 @@ jobs:
 
       - name: Verify APK
         run: |
-          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "=== APK outputs tree ==="
+          find app/build/outputs -type f || true
+          APK_PATH=$(find app/build/outputs -name "*.apk" | head -1)
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
           if [ -z "$APK_PATH" ]; then
             echo "::error::APK not found!"
@@ -66,7 +68,6 @@ jobs:
             echo "::error::APK too small (< 1MB), build likely failed."
             exit 1
           fi
-          # Verify it's actually a ZIP/APK
           FILE_TYPE=$(file -b "$APK_PATH")
           echo "File type: $FILE_TYPE"
           echo "$FILE_TYPE" | grep -qi "zip\|jar" || { echo "::error::Not a valid APK"; exit 1; }
