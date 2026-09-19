@@ -1,6 +1,8 @@
 package com.openmusic.search.di
 
 import com.openmusic.search.data.provider.InternetArchiveProvider
+import com.openmusic.search.data.provider.JamendoProvider
+import com.openmusic.search.data.provider.SoundHelixProvider
 import com.openmusic.search.data.provider.WikimediaProvider
 import com.openmusic.search.data.provider.YoutubeProvider
 import com.openmusic.search.domain.provider.SearchProvider
@@ -21,6 +23,14 @@ abstract class ProviderModule {
     @Binds
     @IntoSet
     abstract fun bindWikimediaProvider(impl: WikimediaProvider): SearchProvider
+
+    @Binds
+    @IntoSet
+    abstract fun bindJamendoProvider(impl: JamendoProvider): SearchProvider
+
+    @Binds
+    @IntoSet
+    abstract fun bindSoundHelixProvider(impl: SoundHelixProvider): SearchProvider
 
     @Binds
     @IntoSet

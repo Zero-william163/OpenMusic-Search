@@ -2,6 +2,7 @@ package com.openmusic.search.di
 
 import com.openmusic.search.BuildConfig
 import com.openmusic.search.data.remote.api.InternetArchiveApi
+import com.openmusic.search.data.remote.api.JamendoApi
 import com.openmusic.search.data.remote.api.WikimediaApi
 import com.openmusic.search.data.remote.api.YoutubeApi
 import com.squareup.moshi.Moshi
@@ -10,7 +11,9 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
@@ -32,11 +35,18 @@ object NetworkModule {
     @Singleton
     fun provideOkHttpClient(): OkHttpClient {
         val logging = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.BASIC
+            level = if (BuildConfig.DEBUG) HttpLoggingInterceptor.Level.BASIC
+                    else HttpLoggingInterceptor.Level.NONE
         }
         return OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
             .addInterceptor(logging)
             .build()
     }
@@ -73,6 +83,16 @@ object NetworkModule {
 
     @Provides
     @Singleton
+    fun provideJamendoApi(client: OkHttpClient, moshi: Moshi): JamendoApi =
+        Retrofit.Builder()
+            .baseUrl("https://api.jamendo.com/v3.0/")
+            .client(client)
+            .addConverterFactory(MoshiConverterFactory.create(moshi))
+            .build()
+            .create(JamendoApi::class.java)
+
+    @Provides
+    @Singleton
     @Named("YOUTUBE_API_KEY")
     fun provideYoutubeApiKey(): String = BuildConfig.YOUTUBE_API_KEY
 
@@ -84,5 +104,6 @@ object NetworkModule {
     @Provides
     @Singleton
     @Named("JAMENDO_CLIENT_ID")
-    fun provideJamendoClientId(): String = BuildConfig.JAMENDO_CLIENT_ID
+    fun provideJamendoClientId(): String =
+        BuildConfig.JAMENDO_CLIENT_ID.ifBlank { "63c716e0" }  // Jamendo 官方公开 demo key
 }

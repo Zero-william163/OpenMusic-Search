@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">archive.org</domain>
+        <domain includeSubdomains="true">wikimedia.org</domain>
+        <domain includeSubdomains="true">wikipedia.org</domain>
+        <domain includeSubdomains="true">jamendo.com</domain>
+        <domain includeSubdomains="true">soundhelix.com</domain>
+        <domain includeSubdomains="true">youtube.com</domain>
+        <domain includeSubdomains="true">googleapis.com</domain>
+    </domain-config>
+</network-security-config>

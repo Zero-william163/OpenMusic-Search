@@ -17,23 +17,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.jvm.JvmSuppressWildcards
 
 /**
  * 播放器管理器。
  *
- * **关键设计**：search() 返回的结果 streamUrl 都是 null（秒返回）。
- * 用户点击播放时，先调用 Provider.resolveStreamUrl() 异步拿真实直链，
- * 再把可播放的条目组成队列喂给 Media3。
- *
- * 流程：点击播放 → 过滤出同 Provider 可解析的条目 → 并发解析直链 → 构建播放队列 → playQueue()
+ * 流程：
+ *  - 已有 streamUrl 的 → 直接播放，不阻塞
+ *  - 没有 streamUrl 但 playable=true 的 → 异步 resolve（有超时）
+ *  - 混合多个来源（Jamendo/IA/Wikimedia）也能同时播放
  */
 @Singleton
 class PlayerManager @Inject constructor(
     private val player: ExoPlayer,
-    private val providers: Set<SearchProvider>
+    private val providers: Set<@JvmSuppressWildcards SearchProvider>
 ) {
+
+    companion object { private const val TAG = "PlayerMgr"; private const val RESOLVE_TIMEOUT_MS = 5_000L }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val providerById by lazy { providers.associateBy { it.id } }
@@ -76,42 +79,48 @@ class PlayerManager @Inject constructor(
     }
 
     /**
-     * 播放：解析直链 → 构建队列 → 播放。
-     * 在 IO scope 异步执行，同时更新 UI 状态。
+     * 混合来源播放：已有直链的直接用，没有的异步 resolve（5s 超时）。
      */
     fun playItem(items: List<SearchResult>, startIndex: Int) {
-        if (items.isEmpty()) return
-        val startItem = items.getOrNull(startIndex) ?: return
-        val provider = providerById[startItem.source.name]
-
-        // 过滤：只保留来自同一个 Provider 的可播放条目（同 sourceId 解析）
-        val sameProviderItems = items.filter { it.source.name == startItem.source.name && it.playable }
-        if (sameProviderItems.isEmpty()) return
+        val playable = items.filter { it.playable }
+        if (playable.isEmpty()) return
+        val startItem = playable.getOrNull(startIndex) ?: return
 
         scope.launch {
             _loading.value = true
             try {
-                // 解析直链（同 Provider 才能解析）
                 val resolved = coroutineScope {
-                    sameProviderItems.map { item ->
+                    playable.map { item ->
                         async {
-                            val url = provider?.resolveStreamUrl(item.sourceId)
-                            if (url != null) item.copy(
-                                streamUrl = url.streamUrl,
-                                downloadUrl = url.downloadUrl,
-                                fileExtension = url.fileExtension,
-                                durationSeconds = url.durationSeconds ?: item.durationSeconds,
-                                bitrate = url.bitrate ?: item.bitrate,
-                                fileSizeBytes = url.fileSizeBytes ?: item.fileSizeBytes,
-                                playable = true,
-                                downloadable = true
-                            ) else null
+                            // 已有直链 → 直接用
+                            if (!item.streamUrl.isNullOrBlank()) {
+                                item
+                            } else {
+                                // 需要 resolve
+                                val provider = providerById[item.source.name]
+                                val url = provider?.let {
+                                    withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
+                                        runCatching { it.resolveStreamUrl(item.sourceId) }
+                                            .getOrNull()
+                                    }
+                                }
+                                if (url != null) item.copy(
+                                    streamUrl = url.streamUrl,
+                                    downloadUrl = url.downloadUrl,
+                                    fileExtension = url.fileExtension,
+                                    durationSeconds = url.durationSeconds ?: item.durationSeconds,
+                                    bitrate = url.bitrate ?: item.bitrate,
+                                    fileSizeBytes = url.fileSizeBytes ?: item.fileSizeBytes,
+                                    playable = true,
+                                    downloadable = item.downloadable || !url.downloadUrl.isNullOrBlank()
+                                ) else null
+                            }
                         }
                     }.awaitAll()
                 }.filterNotNull()
 
                 if (resolved.isEmpty()) {
-                    Log.w("PlayerManager", "No resolvable items")
+                    Log.w(TAG, "所有条目均无法播放")
                     return@launch
                 }
 
@@ -119,7 +128,7 @@ class PlayerManager @Inject constructor(
                 _queue.value = resolved
                 playQueueInternal(resolved, realStartIndex)
             } catch (e: Exception) {
-                Log.e("PlayerManager", "playItem failed", e)
+                Log.e(TAG, "playItem failed", e)
             } finally {
                 _loading.value = false
             }
@@ -127,18 +136,24 @@ class PlayerManager @Inject constructor(
     }
 
     private fun playQueueInternal(items: List<SearchResult>, startIndex: Int) {
-        val mediaItems = items.map { it.toMediaItem() }
+        val mediaItems = items.mapNotNull { it.toMediaItem() }
+        if (mediaItems.isEmpty()) return
         scope.launch(Dispatchers.Main) {
-            player.setMediaItems(mediaItems, startIndex, 0L)
-            player.prepare()
-            player.play()
+            try {
+                player.setMediaItems(mediaItems, startIndex.coerceAtMost(mediaItems.size - 1), 0L)
+                player.prepare()
+                player.play()
+            } catch (e: Exception) {
+                Log.e(TAG, "playQueueInternal failed", e)
+            }
         }
     }
 
     fun playQueue(items: List<SearchResult>, startIndex: Int = 0) {
-        // 这个重载用于直接调用（如解析完后）
-        _queue.value = items
-        playQueueInternal(items, startIndex)
+        val playable = items.filter { !it.streamUrl.isNullOrBlank() }
+        if (playable.isEmpty()) return
+        _queue.value = playable
+        playQueueInternal(playable, startIndex)
     }
 
     fun togglePlayPause() {
@@ -160,14 +175,15 @@ class PlayerManager @Inject constructor(
 
     fun release() { player.release() }
 
-    private fun SearchResult.toMediaItem(): MediaItem {
+    private fun SearchResult.toMediaItem(): MediaItem? {
+        val url = streamUrl ?: return null
         return MediaItem.Builder()
-            .setUri(streamUrl ?: "")
+            .setUri(url)
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(title)
                     .setArtist(author ?: "")
-                    .setArtworkUri(android.net.Uri.parse(thumbnailUrl))
+                    .setArtworkUri(thumbnailUrl?.let { android.net.Uri.parse(it) })
                     .build()
             )
             .build()

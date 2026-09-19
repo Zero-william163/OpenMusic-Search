@@ -37,7 +37,8 @@ enum class Source(val displayName: String) {
     JAMENDO("Jamendo"),
     YOUTUBE("YouTube"),
     SOUNDCLOUD("SoundCloud"),
-    LASTFM("Last.fm");
+    LASTFM("Last.fm"),
+    SOUNDHELIX("SoundHelix");
 
     companion object {
         fun fromId(id: String): Source = entries.firstOrNull { it.name == id } ?: INTERNET_ARCHIVE

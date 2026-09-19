@@ -1,62 +1,91 @@
 package com.openmusic.search.data.repository
 
+import android.util.Log
 import com.openmusic.search.domain.model.SearchResult
+import com.openmusic.search.domain.model.Source
 import com.openmusic.search.domain.provider.SearchProvider
 import com.openmusic.search.domain.repository.SearchRepository
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * 搜索仓库实现：并发调用所有已启用 Provider，合并、去重、排序。
+ * 搜索仓库实现。
  *
- * 去重策略：
- *  - 规范化标题（小写、去标点、去空格）
- *  - 相同规范化标题 + 作者首字母 + 时长接近（±5s）视为同一内容
- *  - 同一组内优先保留可播放的来源作为主卡片，其余归入"其他来源"
- *
- * 排序：可播放的优先；音质高的优先；标题与查询相关度高的优先。
+ * 关键设计：
+ *  - 每个 Provider 有独立超时（8s），超时直接跳过，**不等最慢的那个**。
+ *  - 先搜"正常源"（Jamendo / IA / Wikimedia / YouTube）。
+ *  - 如果全部返回空（真的搜不到 + 所有源都挂），用 SoundHelix 保底——永远不返回空。
  */
 @Singleton
 class SearchRepositoryImpl @Inject constructor(
     private val providers: Set<@JvmSuppressWildcards SearchProvider>
 ) : SearchRepository {
 
+    companion object {
+        private const val TAG = "SearchRepo"
+        private const val PROVIDER_TIMEOUT_MS = 8_000L
+    }
+
     override suspend fun search(query: String, page: Int, pageSize: Int): List<SearchResult> {
-        val enabled = providers.filter { it.enabled }
-        if (enabled.isEmpty()) return emptyList()
+        val normalProviders = providers.filter {
+            it.enabled && it.id != Source.SOUNDHELIX.name
+        }
+        val fallbackProvider = providers.firstOrNull { it.id == Source.SOUNDHELIX.name && it.enabled }
 
         val resultsByProvider = coroutineScope {
-            enabled.map { provider ->
-                async { provider.search(query, page, pageSize) }
+            normalProviders.map { provider ->
+                async {
+                    val r = withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                        runCatching { provider.search(query, page, pageSize) }
+                            .getOrElse {
+                                Log.w(TAG, "${provider.id} 搜索失败: ${it.message}")
+                                emptyList()
+                            }
+                    }
+                    if (r == null) {
+                        Log.w(TAG, "${provider.id} 搜索超时 (${PROVIDER_TIMEOUT_MS}ms)")
+                        emptyList()
+                    } else {
+                        Log.d(TAG, "${provider.id} → ${r.size} 条")
+                        r
+                    }
+                }
             }.awaitAll()
         }
 
         val all = resultsByProvider.flatten()
+        Log.d(TAG, "正常源合计 ${all.size} 条")
+
+        if (all.isEmpty() && fallbackProvider != null) {
+            // 全部为空 → 保底
+            Log.i(TAG, "所有正常源无结果，使用 SoundHelix 保底")
+            val fallback = runCatching { fallbackProvider.search(query, page, pageSize) }
+                .getOrDefault(emptyList())
+            Log.d(TAG, "SoundHelix → ${fallback.size} 条")
+            return fallback
+        }
+
         return dedupeAndSort(all, query)
     }
 
     private fun dedupeAndSort(items: List<SearchResult>, query: String): List<SearchResult> {
-        // 分组
         val groups = LinkedHashMap<String, MutableList<SearchResult>>()
         for (item in items) {
             val key = dedupeKey(item)
             groups.getOrPut(key) { mutableListOf() }.add(item)
         }
 
-        // 每组取主卡片：优先 playable，其次 bitrate 高的
         val merged = groups.values.map { group ->
-            val main = group.sortedWith(
+            group.sortedWith(
                 compareByDescending<SearchResult> { it.playable }
                     .thenByDescending { it.bitrate ?: -1 }
             ).first()
-            // 把同组其他来源附加到主卡片（这里通过复制主卡片并保留 source 信息展示）
-            main
         }
 
-        // 排序：可播放 > 音质高 > 标题包含查询词
         val qNorm = normalize(query)
         return merged.sortedWith(
             compareByDescending<SearchResult> { it.playable }

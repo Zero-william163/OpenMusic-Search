@@ -1,5 +1,6 @@
 package com.openmusic.search.presentation.search
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.paging.Pager
@@ -18,6 +19,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -30,15 +33,21 @@ class SearchViewModel @Inject constructor(
     val playerManager: PlayerManager
 ) : ViewModel() {
 
+    companion object { private const val TAG = "SearchVM" }
+
     private val _query = MutableStateFlow("")
     val query: StateFlow<String> = _query.asStateFlow()
 
     private val _qualityFilter = MutableStateFlow(AudioQualityFilter.DEFAULT)
     val qualityFilter: StateFlow<AudioQualityFilter> = _qualityFilter.asStateFlow()
 
+    // debounce 400ms + distinctUntilChanged：只在用户停手 400ms 后才搜，且相同 query 不重复搜
     @OptIn(ExperimentalCoroutinesApi::class)
     val results: Flow<PagingData<SearchResult>> = _query
+        .debounce(400)
+        .distinctUntilChanged()
         .flatMapLatest { q ->
+            Log.d(TAG, "开始搜索: '$q'")
             if (q.isBlank()) flowOf(PagingData.empty())
             else Pager(PagingConfig(pageSize = 20, initialLoadSize = 20, enablePlaceholders = false)) {
                 SearchPagingSource(repository, q, 20)
