@@ -4,17 +4,21 @@ import com.openmusic.search.data.remote.api.WikimediaApi
 import com.openmusic.search.domain.model.MediaType
 import com.openmusic.search.domain.model.SearchResult
 import com.openmusic.search.domain.model.Source
+import com.openmusic.search.domain.provider.PlayableUrl
 import com.openmusic.search.domain.provider.SearchProvider
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
  * Wikimedia Commons 搜索源。
- * - 无需 API Key
- * - 音频（OGG/MP3/FLAC）与视频（OGV/WebM）直链可播放、可下载（CC / 公有领域）
+ * - search() 秒返回，不查 fileInfo
+ * - resolveStreamUrl() 异步拿真实直链 + 缓存
+ *
+ * 真实直链规则（Wikimedia 的 Canonical File URL）：
+ *   https://upload.wikimedia.org/wikipedia/commons/<md5_prefix>/<md5_hash>/<filename>
+ *  通过 API imageinfo 拿 url 字段最可靠。
  */
 @Singleton
 class WikimediaProvider @Inject constructor(
@@ -35,55 +39,66 @@ class WikimediaProvider @Inject constructor(
         } catch (e: Exception) {
             return emptyList()
         }
-        val docs = response.query?.search.orEmpty()
+        return response.query?.search.orEmpty()
             .filter { doc ->
                 val ext = doc.title?.substringAfterLast('.', "")?.lowercase()
                 ext in audioExts || ext in videoExts
             }
-
-        return coroutineScope {
-            docs.map { doc -> async { docToResult(doc) } }.awaitAll().filterNotNull()
-        }
+            .mapNotNull { doc ->
+                val title = doc.title ?: return@mapNotNull null
+                val ext = title.substringAfterLast('.', "").lowercase()
+                val isVideo = ext in videoExts
+                val cleanTitle = title.substringAfter("File:").substringBeforeLast('.')
+                SearchResult(
+                    id = "$id:${title.hashCode()}",
+                    sourceId = title,  // 含 "File:" 前缀
+                    source = Source.WIKIMEDIA_COMMONS,
+                    title = cleanTitle,
+                    author = null,
+                    thumbnailUrl = null, // 搜索 API 不给缩略图，resolve 时一起拿
+                    durationSeconds = null,
+                    bitrate = null,
+                    mediaType = if (isVideo) MediaType.VIDEO else MediaType.AUDIO,
+                    streamUrl = null,
+                    downloadUrl = null,
+                    originalUrl = "https://commons.wikimedia.org/wiki/$title",
+                    publishedAt = null,
+                    playable = true,
+                    downloadable = true
+                )
+            }
     }
 
-    private suspend fun docToResult(doc: com.openmusic.search.data.remote.dto.WikimediaSearchDoc): SearchResult? {
-        val title = doc.title ?: return null
-        val ext = title.substringAfterLast('.', "").lowercase()
-        val isVideo = ext in videoExts
+    private val urlCache = LinkedHashMap<String, PlayableUrl>(32, 0.75f, true)
+    private val cacheLock = Mutex()
+
+    override suspend fun resolveStreamUrl(sourceId: String): PlayableUrl? {
+        cacheLock.withLock { urlCache[sourceId]?.let { return it } }
 
         val info = try {
-            api.fileInfo(titles = title)
+            api.fileInfo(titles = sourceId)
         } catch (e: Exception) {
-            null
+            return null
         }
-        val page = info?.query?.pages?.values?.firstOrNull()
-        val imageInfo = page?.imageinfo?.firstOrNull()
-        val url = imageInfo?.url
-        val mime = imageInfo?.mime ?: ""
-        val size = imageInfo?.size
-        val duration = imageInfo?.duration?.toLong()
+        val page = info.query?.pages?.values?.firstOrNull() ?: return null
+        val ii = page.imageinfo?.firstOrNull() ?: return null
+        val url = ii.url ?: return null
+        val mime = ii.mime ?: ""
+        val ext = sourceId.substringAfterLast('.', "").lowercase()
 
-        val fileName = title.removePrefix("File:")
-        val cleanTitle = fileName.substringBeforeLast('.')
-
-        return SearchResult(
-            id = "$id:${title.hashCode()}",
-            sourceId = title,
-            source = Source.WIKIMEDIA_COMMONS,
-            title = cleanTitle,
-            author = null,
-            thumbnailUrl = imageInfo?.thumburl,
-            durationSeconds = duration,
-            bitrate = null, // Wikimedia 不提供码率，标记为未知
-            mediaType = if (isVideo) MediaType.VIDEO else MediaType.AUDIO,
+        val result = PlayableUrl(
             streamUrl = url,
             downloadUrl = url,
-            originalUrl = "https://commons.wikimedia.org/wiki/$title",
-            publishedAt = null,
-            playable = url != null && mime.startsWith("audio") || (url != null && mime.startsWith("video")),
-            downloadable = url != null,
             fileExtension = ext,
-            fileSizeBytes = size
+            durationSeconds = ii.duration?.toLong(),
+            bitrate = null,
+            fileSizeBytes = ii.size,
+            mime = mime
         )
+        cacheLock.withLock {
+            if (urlCache.size > 64) urlCache.remove(urlCache.keys.first())
+            urlCache[sourceId] = result
+        }
+        return result
     }
 }
