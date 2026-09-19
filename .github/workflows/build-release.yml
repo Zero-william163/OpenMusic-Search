@@ -70,7 +70,7 @@ jobs:
           fi
           FILE_TYPE=$(file -b "$APK_PATH")
           echo "File type: $FILE_TYPE"
-          echo "$FILE_TYPE" | grep -qi "zip\|jar" || { echo "::error::Not a valid APK"; exit 1; }
+          echo "$FILE_TYPE" | grep -qiE "zip|jar|apk" || { echo "::error::Not a valid APK"; exit 1; }
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
